@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# ghperf -- contribution report for one GitHub user within one organization.
+#
+# Every single-quoted $ in this file is a GraphQL variable, not a shell one.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+readonly PROGNAME=${0##*/}
+readonly API=https://api.github.com/graphql
+readonly SEARCH_CAP=1000
+readonly MAX_ATTEMPTS=5
+
+WORKDIR=
+trap '[[ -n $WORKDIR ]] && rm -rf "$WORKDIR"' EXIT
+
+die() { printf '%s: %s\n' "$PROGNAME" "$1" >&2; exit "${2:-1}"; }
+
+usage() {
+    cat <<EOF
+Usage: $PROGNAME --org NAME [options]
+
+Options:
+  --org NAME      GitHub organization to report on (required)
+  --user LOGIN    User to report on (default: authenticated user)
+  --since SPEC    Start of window (default: user's account creation)
+  --until SPEC    End of window (default: now)
+  -h, --help      This message
+
+SPEC accepts journalctl-style dates: 2026-01-01, "2026-01-01 10:30:00",
+yesterday, today, now, -3d, "2 weeks ago", @1700000000.
+
+Authentication is taken from gh, then \$GITHUB_TOKEN, then \$GH_TOKEN.
+EOF
+}
+
+# --- dates ---------------------------------------------------------------
+
+# journalctl accepts compact offsets and midnight-anchored day names; date(1)
+# accepts neither, so normalize before handing it over.
+normalize_date() {
+    local spec=$1 out
+    if [[ $spec =~ ^([+-][0-9]+)([smhdwMy])$ ]]; then
+        local n=${BASH_REMATCH[1]} unit
+        case ${BASH_REMATCH[2]} in
+            s) unit=seconds ;; m) unit=minutes ;; h) unit=hours ;;
+            d) unit=days ;;    w) unit=weeks ;;   M) unit=months ;;
+            y) unit=years ;;
+        esac
+        spec="$n $unit"
+    fi
+    case $spec in today|yesterday|tomorrow) spec="$spec 00:00:00" ;; esac
+    out=$(date -u -d "$spec" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
+        || die "unparseable date: $1" 1
+    printf '%s' "$out"
+}
+
+epoch()    { date -u -d "$1" +%s; }
+iso()      { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+day()      { printf '%s' "${1%%T*}"; }
+next_day() { date -u -d "$1 +1 day" +%Y-%m-%d; }
+
+# contributionsCollection accepts at most one year per call.
+year_chunks() {
+    local start=$1 stop=$2 from to
+    from=$start
+    while (( $(epoch "$from") < $(epoch "$stop") )); do
+        to=$(date -u -d "$from +1 year -1 second" +%Y-%m-%dT%H:%M:%SZ)
+        (( $(epoch "$to") > $(epoch "$stop") )) && to=$stop
+        printf '%s %s\n' "$from" "$to"
+        from=$(iso $(( $(epoch "$to") + 1 )))
+    done
+}
+
+# --- transport -----------------------------------------------------------
+
+resolve_token() {
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        gh auth token 2>/dev/null && return 0
+    fi
+    [[ -n ${GITHUB_TOKEN:-} ]] && { printf '%s' "$GITHUB_TOKEN"; return 0; }
+    [[ -n ${GH_TOKEN:-} ]]     && { printf '%s' "$GH_TOKEN";     return 0; }
+    return 1
+}
+
+retry_delay() {
+    local headers=$1 attempt=$2 after
+    after=$(sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*\([0-9]\+\).*/\1/p' "$headers")
+    [[ -n $after ]] && { printf '%s' "$after"; return; }
+    printf '%s' $(( 1 << (attempt - 1) ))
+}
+
+gql() {
+    local query=$1 vars=${2:-'{}'} attempt=1 status
+    local body=$WORKDIR/body headers=$WORKDIR/headers
+    jq -n --arg q "$query" --argjson v "$vars" '{query:$q,variables:$v}' \
+        > "$WORKDIR/request"
+
+    while :; do
+        status=$(curl -sS -o "$body" -D "$headers" -w '%{http_code}' \
+            -X POST "$API" \
+            -K "$WORKDIR/curlrc" \
+            -H 'Content-Type: application/json' \
+            --data-binary "@$WORKDIR/request") || die "cannot reach $API" 3
+        case $status in
+            200) break ;;
+            401) die "authentication rejected by GitHub" 2 ;;
+            403|429)
+                (( attempt >= MAX_ATTEMPTS )) && {
+                    cat "$body" >&2; die "HTTP $status after $MAX_ATTEMPTS attempts" 3; }
+                sleep "$(retry_delay "$headers" "$attempt")"
+                (( ++attempt )) ;;
+            *) cat "$body" >&2; die "HTTP $status" 3 ;;
+        esac
+    done
+
+    if jq -e 'has("errors")' "$body" >/dev/null; then
+        jq -r '.errors[].message' "$body" >&2
+        jq -e '[.errors[].type] | index("NOT_FOUND")' "$body" >/dev/null \
+            && die "organization or user not found, or not visible to these credentials" 1
+        die "GraphQL error" 3
+    fi
+    jq -c '.data' "$body"
+}
+
+# Emits connection nodes as NDJSON. Asserts the collected count against the
+# connection's own total, which is what makes silent truncation impossible.
+paginate() {
+    local query=$1 vars=$2 path=$3
+    local cursor=null total='' collected=0 data conn out
+    out=$(mktemp "$WORKDIR/nodes.XXXXXX")
+    while :; do
+        data=$(gql "$query" "$(jq -c --argjson c "$cursor" '.cursor=$c' <<<"$vars")")
+        conn=$(jq -c "$path" <<<"$data")
+        [[ -z $total ]] && total=$(jq -r '.totalCount // .issueCount' <<<"$conn")
+        jq -c '.nodes[]' <<<"$conn" >> "$out"
+        collected=$(( collected + $(jq '.nodes | length' <<<"$conn") ))
+        [[ $(jq -r '.pageInfo.hasNextPage' <<<"$conn") == true ]] || break
+        cursor=$(jq -c '.pageInfo.endCursor' <<<"$conn")
+    done
+    (( collected == total )) \
+        || die "pagination mismatch on $path: collected $collected of $total" 3
+    cat "$out"
+}
+
+# Search returns at most 1000 results however it is paged, so any range over
+# that is bisected until every part fits.
+search_collect() {
+    local query=$1 vars=$2 prefix=$3 from=$4 to=$5
+    local q count mid
+    q="$prefix created:$from..$to"
+    count=$(gql "$query" "$(jq -c --arg q "$q" '.q=$q | .cursor=null' <<<"$vars")" \
+        | jq -r '.search.issueCount')
+
+    if (( count > SEARCH_CAP )); then
+        mid=$(day "$(iso $(( ($(epoch "$from") + $(epoch "$to")) / 2 )))")
+        [[ $mid == "$to" ]] && mid=$from
+        [[ $mid == "$from" && $from == "$to" ]] \
+            && die "more than $SEARCH_CAP results in a single day ($from)" 3
+        search_collect "$query" "$vars" "$prefix" "$from" "$mid"
+        search_collect "$query" "$vars" "$prefix" "$(next_day "$mid")" "$to"
+        return
+    fi
+    paginate "$query" "$(jq -c --arg q "$q" '.q=$q' <<<"$vars")" '.search'
+}
+
+# --- queries -------------------------------------------------------------
+
+readonly Q_VIEWER='query { viewer { login } }'
+
+readonly Q_USER='query($login:String!) { user(login:$login) { createdAt } }'
+
+readonly Q_ORG='query($org:String!) {
+  organization(login:$org) { id repositories { totalCount } } }'
+
+readonly Q_CONTRIB='query($login:String!,$orgId:ID!,$from:DateTime!,$to:DateTime!) {
+  user(login:$login) {
+    contributionsCollection(organizationID:$orgId, from:$from, to:$to) {
+      totalCommitContributions
+      commitContributionsByRepository(maxRepositories:100){repository{nameWithOwner}}
+      issueContributionsByRepository(maxRepositories:100){repository{nameWithOwner}}
+      pullRequestContributionsByRepository(maxRepositories:100){repository{nameWithOwner}}
+      pullRequestReviewContributionsByRepository(maxRepositories:100){repository{nameWithOwner}}
+    } } }'
+
+readonly Q_PRS='query($q:String!,$cursor:String) {
+  search(query:$q, type:ISSUE, first:100, after:$cursor) {
+    issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      id merged additions deletions totalCommentsCount
+      reviews(first:100) {
+        totalCount nodes { state bodyText author { login } comments { totalCount } } }
+    } } } }'
+
+readonly Q_REVIEWS='query($q:String!,$login:String!,$cursor:String) {
+  search(query:$q, type:ISSUE, first:100, after:$cursor) {
+    issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      id author { login }
+      reviews(first:100, author:$login) {
+        totalCount nodes { state bodyText comments { totalCount } } }
+    } } } }'
+
+readonly Q_ISSUES='query($q:String!,$cursor:String) {
+  search(query:$q, type:ISSUE, first:100, after:$cursor) {
+    issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on Issue { id closed comments { totalCount } } } } }'
+
+readonly Q_COMMENTS='query($login:String!,$cursor:String) {
+  user(login:$login) {
+    issueComments(first:100, after:$cursor, orderBy:{field:UPDATED_AT,direction:DESC}) {
+      totalCount pageInfo { hasNextPage endCursor }
+      nodes { createdAt repository { nameWithOwner } issue { id } pullRequest { id } }
+    } } }'
+
+# --- report --------------------------------------------------------------
+
+source_advertisement() {
+    command -v git >/dev/null 2>&1 || return 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    local remote url
+    remote=$(git remote 2>/dev/null | head -n1) || return 0
+    [[ -n $remote ]] || return 0
+    url=$(git remote get-url "$remote" 2>/dev/null) || return 0
+    [[ -n $url ]] && printf 'Created with %s\n\n' "$url"
+    return 0
+}
+
+row() { printf '| %s | %s |\n' "$1" "$2"; }
+
+section() {
+    printf '\n## %s\n\n| Metric | Value |\n| --- | --- |\n' "$1"
+}
+
+main() {
+    local org='' user='' since='' until=''
+
+    while (( $# )); do
+        case $1 in
+            --org)   org=${2:-};   shift 2 || die "--org needs a value" 1 ;;
+            --user)  user=${2:-};  shift 2 || die "--user needs a value" 1 ;;
+            --since) since=${2:-}; shift 2 || die "--since needs a value" 1 ;;
+            --until) until=${2:-}; shift 2 || die "--until needs a value" 1 ;;
+            -h|--help) usage; return 0 ;;
+            *) usage >&2; die "unknown argument: $1" 1 ;;
+        esac
+    done
+    [[ -n $org ]] || { usage >&2; die "--org is required" 1; }
+
+    for tool in curl jq date; do
+        command -v "$tool" >/dev/null 2>&1 || die "missing dependency: $tool" 1
+    done
+
+    WORKDIR=$(mktemp -d)
+    local token
+    token=$(resolve_token) \
+        || die "no credentials: run 'gh auth login', or set \$GITHUB_TOKEN or \$GH_TOKEN" 2
+    # Kept in a config file rather than an -H argument: argv is visible to ps.
+    ( umask 077; printf 'header = "Authorization: bearer %s"\n' "$token" \
+        > "$WORKDIR/curlrc" )
+    unset token
+
+    [[ -n $user ]] || user=$(gql "$Q_VIEWER" | jq -r '.viewer.login')
+
+    local org_data org_id repo_total
+    org_data=$(gql "$Q_ORG" "$(jq -nc --arg o "$org" '{org:$o}')")
+    org_id=$(jq -r '.organization.id' <<<"$org_data")
+    repo_total=$(jq -r '.organization.repositories.totalCount' <<<"$org_data")
+
+    if [[ -n $since ]]; then since=$(normalize_date "$since")
+    else since=$(gql "$Q_USER" "$(jq -nc --arg l "$user" '{login:$l}')" \
+        | jq -r '.user.createdAt'); fi
+    until=$(normalize_date "${until:-now}")
+    (( $(epoch "$since") < $(epoch "$until") )) || die "--since must precede --until" 1
+
+    local from_day to_day
+    from_day=$(day "$since"); to_day=$(day "$until")
+
+    # contributions, summed and unioned across yearly chunks
+    local contrib=$WORKDIR/contrib
+    : > "$contrib"
+    while read -r cfrom cto; do
+        gql "$Q_CONTRIB" "$(jq -nc --arg l "$user" --arg i "$org_id" \
+            --arg f "$cfrom" --arg t "$cto" \
+            '{login:$l,orgId:$i,from:$f,to:$t}')" >> "$contrib"
+    done < <(year_chunks "$since" "$until")
+
+    local commits repos_touched truncated
+    commits=$(jq -s '[.[].user.contributionsCollection.totalCommitContributions] | add' "$contrib")
+    repos_touched=$(jq -s '[.[].user.contributionsCollection
+        | (.commitContributionsByRepository, .issueContributionsByRepository,
+           .pullRequestContributionsByRepository, .pullRequestReviewContributionsByRepository)
+        | .[].repository.nameWithOwner] | unique | length' "$contrib")
+    truncated=$(jq -s '[.[].user.contributionsCollection
+        | (.commitContributionsByRepository, .issueContributionsByRepository,
+           .pullRequestContributionsByRepository, .pullRequestReviewContributionsByRepository)
+        | length] | map(select(. == 100)) | length' "$contrib")
+    (( truncated )) && printf '%s: warning: a contribution list returned exactly 100 repositories; totals may be truncated\n' \
+        "$PROGNAME" >&2
+
+    local prs reviews issues comments
+    prs=$(search_collect "$Q_PRS" '{}' "org:$org author:$user is:pr" "$from_day" "$to_day" \
+        | jq -sc 'unique_by(.id)')
+    reviews=$(search_collect "$Q_REVIEWS" "$(jq -nc --arg l "$user" '{login:$l}')" \
+        "org:$org is:pr reviewed-by:$user" "$from_day" "$to_day" | jq -sc 'unique_by(.id)')
+    issues=$(search_collect "$Q_ISSUES" '{}' "org:$org author:$user is:issue" "$from_day" "$to_day" \
+        | jq -sc 'unique_by(.id)')
+    comments=$(paginate "$Q_COMMENTS" "$(jq -nc --arg l "$user" '{login:$l}')" \
+        '.user.issueComments' | jq -sc .)
+
+    # A review connection truncated at 100 would corrupt every node-derived
+    # review metric while leaving totalCount correct.
+    jq -e 'all(.[]; .reviews.totalCount <= 100)' <<<"$prs" >/dev/null \
+        || die "a pull request has more than 100 reviews; node-derived metrics would undercount" 3
+    jq -e 'all(.[]; .reviews.totalCount <= 100)' <<<"$reviews" >/dev/null \
+        || die "a pull request has more than 100 reviews by $user" 3
+
+    local pr_m rv_m is_m cm_m
+    pr_m=$(jq -c --arg u "$user" '{
+        opened: length,
+        merged: [.[] | select(.merged)] | length,
+        added:  ([.[] | select(.merged) | .additions] | add // 0),
+        deleted:([.[] | select(.merged) | .deletions] | add // 0),
+        comments: ([.[].totalCommentsCount] | add // 0),
+        reviewed: [.[] | select(any(.reviews.nodes[]; (.author.login // "") != $u))] | length,
+        approvals: [.[].reviews.nodes[]
+            | select((.author.login // "") != $u and .state == "APPROVED")] | length,
+        changes: [.[].reviews.nodes[]
+            | select((.author.login // "") != $u and .state == "CHANGES_REQUESTED")] | length
+    }' <<<"$prs")
+
+    rv_m=$(jq -c --arg u "$user" '[.[] | select((.author.login // "") != $u)] | {
+        prs: length,
+        submitted: ([.[].reviews.totalCount] | add // 0),
+        inline: ([.[].reviews.nodes[].comments.totalCount] | add // 0),
+        written: [.[].reviews.nodes[] | select((.bodyText // "") | test("\\S"))] | length,
+        approvals: [.[].reviews.nodes[] | select(.state == "APPROVED")] | length
+    }' <<<"$reviews")
+
+    is_m=$(jq -c '{
+        opened: length,
+        closed: [.[] | select(.closed)] | length,
+        comments: ([.[].comments.totalCount] | add // 0)
+    }' <<<"$issues")
+
+    cm_m=$(jq -c --arg org "$org" --arg since "$since" --arg until "$until" '
+        [.[] | select(.repository.nameWithOwner | startswith($org + "/"))
+             | select(.createdAt >= $since and .createdAt <= $until)]
+        | { prs:    [.[] | select(.pullRequest)] | length,
+            issues: [.[] | select(.issue and (.pullRequest | not))] | length }
+    ' <<<"$comments")
+
+    source_advertisement
+    printf '# Contribution Report -- %s\n\n' "$user"
+    printf '| Scope | |\n| --- | --- |\n'
+    row Organization "$org"
+    row User "$user"
+    row Window "$from_day to $to_day"
+    row Generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    section Projects
+    row 'Projects owned / maintained' 'TBD -- requires manual entry'
+    row 'Repositories contributed to' "$repos_touched"
+    row 'Repositories in organization' "$repo_total"
+
+    section Commits
+    row Commits "$commits"
+    row 'Lines added'   "$(jq -r .added   <<<"$pr_m")"
+    row 'Lines deleted' "$(jq -r .deleted <<<"$pr_m")"
+
+    section 'Pull Requests'
+    row Opened "$(jq -r .opened <<<"$pr_m")"
+    row Merged "$(jq -r .merged <<<"$pr_m")"
+    row 'Comments authored on pull requests' "$(jq -r .prs <<<"$cm_m")"
+    row 'Comments on opened pull requests, all authors' "$(jq -r .comments <<<"$pr_m")"
+    row 'Pull requests receiving outside review' "$(jq -r .reviewed <<<"$pr_m")"
+    row 'Approvals received' "$(jq -r .approvals <<<"$pr_m")"
+    row 'Changes requested received' "$(jq -r .changes <<<"$pr_m")"
+
+    section 'Code Review'
+    row 'Pull requests reviewed' "$(jq -r .prs <<<"$rv_m")"
+    row 'Reviews submitted' "$(jq -r .submitted <<<"$rv_m")"
+    row 'Inline review comments authored' "$(jq -r .inline <<<"$rv_m")"
+    row 'Reviews containing written feedback' "$(jq -r .written <<<"$rv_m")"
+    row 'Approvals given' "$(jq -r .approvals <<<"$rv_m")"
+
+    section Issues
+    row Opened "$(jq -r .opened <<<"$is_m")"
+    row Closed "$(jq -r .closed <<<"$is_m")"
+    row 'Comments authored on issues' "$(jq -r .issues <<<"$cm_m")"
+    row 'Comments on opened issues, all authors' "$(jq -r .comments <<<"$is_m")"
+
+    cat <<EOF
+
+## Notes
+
+- Metrics are scoped to objects created within the window. A pull request
+  opened before the window is excluded even if it was reviewed during the
+  window.
+- Counts on in-window objects may increase after the window closes, so reruns
+  of the same window can return higher values.
+- Comment totals on opened pull requests and issues count all authors,
+  including $user and automated accounts.
+- Every review-derived metric, in both the Pull Requests and Code Review
+  sections, excludes reviews authored by $user.
+- "Comments authored on pull requests" counts conversation comments; inline
+  review comments are reported separately under Code Review.
+- Commits are counted on the default branch only.
+- Line counts cover merged pull requests only.
+EOF
+}
+
+main "$@"
